@@ -1,0 +1,149 @@
+{
+  "name": "My workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "inventory/shopify",
+        "options": {}
+      },
+      "name": "Webhook: Shopify (inventory update)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        464,
+        80
+      ],
+      "id": "b8b7afa1-f8ea-43da-9661-4b450f67c8ac",
+      "webhookId": "8123d07b-da7a-46bb-a7bc-b943ad8f54b2"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "inventory/pos",
+        "options": {}
+      },
+      "name": "Webhook: POS (sale/adjustment)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        448,
+        320
+      ],
+      "id": "acaaf471-1580-41ac-bf27-ee5a4886887b",
+      "webhookId": "a4023a4e-4502-488b-a368-abdd3abdd7ce"
+    },
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "everyX",
+              "value": 10,
+              "unit": "minutes"
+            }
+          ]
+        }
+      },
+      "name": "Cron: periodic sync (10m)",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [
+        448,
+        -160
+      ],
+      "id": "cfa97c5f-7008-4cee-a396-e3b1a78f2d37"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "/*\nExpected tables (minimal):\n\nwarehouse_inventory\n  - sku TEXT PRIMARY KEY\n  - on_hand INTEGER NOT NULL\n  - reorder_threshold INTEGER NULL      -- per-SKU; use env default if NULL\n  - supplier_email TEXT NULL            -- direct supplier email (optional)\n  - supplier_slack TEXT NULL            -- Slack channel ID or name (optional)\n\ninventory_map\n  - sku TEXT PRIMARY KEY REFERENCES warehouse_inventory(sku)\n  - shopify_inventory_item_id BIGINT NOT NULL\n  - shopify_location_id BIGINT NOT NULL\n  - pos_item_id TEXT NULL               -- your POS item identifier\n*/\n\nSELECT\n  i.sku,\n  i.on_hand,\n  i.reorder_threshold,\n  i.supplier_email,\n  i.supplier_slack,\n  m.shopify_inventory_item_id,\n  m.shopify_location_id,\n  m.pos_item_id\nFROM warehouse_inventory i\nLEFT JOIN inventory_map m USING (sku);",
+        "additionalFields": {}
+      },
+      "name": "Postgres: fetch inventory + mappings",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 1,
+      "position": [
+        880,
+        0
+      ],
+      "id": "7d5cf7e6-7567-42e6-9522-b058547bf06f",
+      "credentials": {
+        "postgres": {
+          "id": "KdOvWQpeorjuzv9S",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Reconcile + Push updates to Shopify & POS + Notifications */\n\nconst env = (k, d=undefined) => (typeof process !== 'undefined' && process.env && process.env[k] !== undefined) ? process.env[k] : d;\n\nconst shopDomain  = env('SHOPIFY_STORE');\nconst shopToken   = env('SHOPIFY_TOKEN');\nconst shopVer     = env('SHOPIFY_API_VERSION', '2024-10');\nconst dryRun      = env('SHOPIFY_DRY_RUN', '') === '1';\nconst hideOOS     = env('SHOPIFY_HIDE_OOS', '') === '1';\nconst fallbackLoc = env('SHOPIFY_DEFAULT_LOCATION_ID') ? Number(env('SHOPIFY_DEFAULT_LOCATION_ID')) : undefined;\n\nconst posUrl    = env('POS_UPDATE_URL');\nconst posToken  = env('POS_TOKEN');\n\nconst slackToken = env('SLACK_BOT_TOKEN');\nconst slackChan  = env('SLACK_DEFAULT_CHANNEL', '#purchasing');\n\nconst sgKey        = env('SENDGRID_API_KEY');\nconst fromEmail    = env('FROM_EMAIL', 'inventory-bot@yourbrand.com');\nconst fallbackEmail= env('PROCUREMENT_EMAIL');\n\nconst defThresh = Number(env('DEFAULT_REORDER_THRESHOLD', 5));\nconst defMult   = Number(env('DEFAULT_REORDER_MULTIPLIER', 2));\nconst defMinRe  = Number(env('DEFAULT_MIN_REORDER_QTY', 10));\n\nfunction calcReorderQty(onHand, threshold) {\n  const target = Math.max(threshold * defMult, threshold + defMinRe);\n  return Math.max(target - onHand, defMinRe);\n}\n\nasync function shopifySetInventory(location_id, inventory_item_id, available) {\n  const url = `https://${shopDomain}.myshopify.com/admin/api/${shopVer}/inventory_levels/set.json`;\n  const body = { location_id, inventory_item_id, available };\n  if (dryRun) return { dryRun: true, body };\n  return await this.helpers.httpRequest({\n    method: 'POST', url, json: true, body,\n    headers: { 'X-Shopify-Access-Token': shopToken }\n  });\n}\n\nasync function shopifyHideVariant(inventory_item_id) {\n  return { note: 'OOS reflected by qty=0; ensure inventory policy is DENY and IG channel is linked.' };\n}\n\nasync function posUpdate(pos_item_id, sku, quantity) {\n  if (!posUrl || !posToken) return { skipped: true, reason: 'POS not configured' };\n  if (dryRun) return { dryRun: true, pos_item_id, quantity };\n  return await this.helpers.httpRequest({\n    method: 'POST', url: posUrl, json: true,\n    headers: { Authorization: `Bearer ${posToken}` },\n    body: { pos_item_id, sku, quantity }\n  });\n}\n\nasync function slackNotify(text, channel) {\n  if (!slackToken) return { skipped: true };\n  if (dryRun) return { dryRun: true, text, channel };\n  return await this.helpers.httpRequest({\n    method: 'POST', url: 'https://slack.com/api/chat.postMessage', json: true,\n    headers: { Authorization: `Bearer ${slackToken}` },\n    body: { channel: channel || slackChan, text }\n  });\n}\n\nasync function emailSupplier(toEmail, subject, text) {\n  if (!sgKey || !toEmail) return { skipped: true };\n  if (dryRun) return { dryRun: true, toEmail, subject };\n  return await this.helpers.httpRequest({\n    method: 'POST', url: 'https://api.sendgrid.com/v3/mail/send',\n    headers: { Authorization: `Bearer ${sgKey}` },\n    body: {\n      personalizations: [{ to: [{ email: toEmail }], subject }],\n      from: { email: fromEmail, name: 'Inventory Bot' },\n      content: [{ type: 'text/plain', value: text }]\n    },\n    json: true\n  });\n}\n\nconst rows = items.map(i => i.json);\nconst out = [];\n\nfor (const r of rows) {\n  const sku        = r.sku;\n  const onHand     = Number(r.on_hand);\n  const locationId = Number(r.shopify_location_id || fallbackLoc);\n  const invItemId  = Number(r.shopify_inventory_item_id);\n  const posItemId  = r.pos_item_id || null;\n  const threshold  = r.reorder_threshold != null ? Number(r.reorder_threshold) : defThresh;\n  const supplierEmail = r.supplier_email || fallbackEmail || null;\n  const supplierSlack = r.supplier_slack || slackChan;\n\n  const result = { sku, onHand, threshold, updated: {}, notifications: {} };\n\n  try {\n    if (!shopDomain || !shopToken || !invItemId || !locationId || Number.isNaN(invItemId) || Number.isNaN(locationId)) {\n      result.updated = { ...result.updated, shopify: { skipped: true, reason: 'Missing Shopify config or mapping' } };\n    } else {\n      const res = await shopifySetInventory.call(this, locationId, invItemId, onHand);\n      result.updated = { ...result.updated, shopify: { ok: true, res } };\n    }\n  } catch (e) {\n    result.updated = { ...result.updated, shopify: { ok: false, error: e.message || e.toString() } };\n  }\n\n  try {\n    const res = await posUpdate.call(this, posItemId, sku, onHand);\n    result.updated = { ...result.updated, pos: res };\n  } catch (e) {\n    result.updated = { ...result.updated, pos: { ok: false, error: e.message || e.toString() } };\n  }\n\n  if (onHand <= 0 && hideOOS) {\n    try {\n      const res = await shopifyHideVariant.call(this, invItemId);\n      result.updated = { ...result.updated, visibility: res };\n    } catch (e) {\n      result.updated = { ...result.updated, visibility: { ok: false, error: e.message || e.toString() } };\n    }\n  }\n\n  if (onHand <= threshold) {\n    const reorderQty = calcReorderQty(onHand, threshold);\n    const text = `⚠️ Low stock: *${sku}*\\nOn hand: ${onHand} (threshold: ${threshold})\\nSuggested reorder: ${reorderQty}`;\n\n    try {\n      const sres = await slackNotify.call(this, text, supplierSlack);\n      result.notifications.slack = sres;\n    } catch (e) {\n      result.notifications.slack = { ok: false, error: e.message || e.toString() };\n    }\n\n    try {\n      const eres = await emailSupplier.call(this, supplierEmail, `Reorder Request: ${sku}`, `${text}\\n\\nPlease confirm lead time and ship to our usual address.`);\n      result.notifications.email = eres;\n    } catch (e) {\n      result.notifications.email = { ok: false, error: e.message || e.toString() };\n    }\n\n    result.reorder = { requested: true, qty: reorderQty };\n  } else {\n    result.reorder = { requested: false };\n  }\n\n  out.push({ json: result });\n}\n\nreturn out;"
+      },
+      "name": "Function: reconcile + push + notify",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1184,
+        0
+      ],
+      "id": "ede7ee61-e14c-4ecf-95af-4981712cea53"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Cron: periodic sync (10m)": {
+      "main": [
+        [
+          {
+            "node": "Postgres: fetch inventory + mappings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook: Shopify (inventory update)": {
+      "main": [
+        [
+          {
+            "node": "Postgres: fetch inventory + mappings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook: POS (sale/adjustment)": {
+      "main": [
+        [
+          {
+            "node": "Postgres: fetch inventory + mappings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres: fetch inventory + mappings": {
+      "main": [
+        [
+          {
+            "node": "Function: reconcile + push + notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "fb9045008a9cc013cfb89e5d4504a5822610a53295d2b482c4020229a151311e"
+  },
+  "tags": []
+}
