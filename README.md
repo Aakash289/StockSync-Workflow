@@ -1,6 +1,6 @@
 # StockSync-Workflow
 
-Automated inventory reconciliation and low-stock reordering with a single n8n workflow.
+Automated inventory reconciliation and low-stock reordering with n8n workflow.
 Keeps Shopify (incl. Instagram Shop), your POS, and your warehouse DB perfectly in sync—and pings suppliers the moment stock dips below a threshold.
 
 ✨ What this is
